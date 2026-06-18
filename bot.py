@@ -3,7 +3,7 @@ import requests
 from telebot import types
 from telebot import apihelper
 
-BOT_TOKEN = "8993552703:AAGwFJ4k3JYMk-mar3UTmBXn55ctqvmK_AQ"
+BOT_TOKEN = 
 
 # Создаем бота с учетом прокси
 bot = telebot.TeleBot(BOT_TOKEN)
