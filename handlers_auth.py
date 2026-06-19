@@ -1,14 +1,13 @@
-import asyncio
 import re
-from typing import Any
+from pathlib import Path
 
-from aiohttp import ClientError, ClientSession, ContentTypeError
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
+from auth_storage import UsersStorage
 from config import Settings
 
 router = Router(name="auth")
@@ -19,22 +18,21 @@ LOGOUT_TEXT = "Выйти"
 CANCEL_TEXT = "Отмена"
 
 AUTHORIZED_USERS: set[int] = set()
-EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+LOGIN_PATTERN = re.compile(r"^[^\s]{3,32}$")
+STORAGES: dict[str, UsersStorage] = {}
 
 
 class RegistrationStates(StatesGroup):
     # Шаги регистрации
-    waiting_name = State()
-    waiting_email = State()
+    waiting_full_name = State()
+    waiting_login = State()
     waiting_password = State()
-    waiting_code = State()
 
 
 class LoginStates(StatesGroup):
     # Шаги входа
-    waiting_email = State()
+    waiting_login = State()
     waiting_password = State()
-    waiting_code = State()
 
 
 def get_start_keyboard() -> ReplyKeyboardMarkup:
@@ -76,42 +74,19 @@ def is_authorized(user_id: int) -> bool:
     return user_id in AUTHORIZED_USERS
 
 
-def build_auth_url(settings: Settings, path: str) -> str:
-    # Сборка URL авторизации
-    return f"{settings.AUTH_SERVICE_URL.rstrip('/')}{path}"
+def is_valid_login(login: str) -> bool:
+    # Проверка логина
+    return bool(LOGIN_PATTERN.fullmatch(login))
 
 
-def is_valid_email(email: str) -> bool:
-    # Проверка email
-    return bool(EMAIL_PATTERN.fullmatch(email))
+def get_storage(settings: Settings) -> UsersStorage:
+    # Получение хранилища пользователей
+    storage_path = str(Path(settings.USERS_STORAGE_PATH).resolve())
 
+    if storage_path not in STORAGES:
+        STORAGES[storage_path] = UsersStorage(storage_path)
 
-def extract_error(data: dict[str, Any], fallback: str) -> str:
-    # Извлечение ошибки
-    return str(data.get("error") or data.get("message") or fallback)
-
-
-async def request_json(
-    http_session: ClientSession,
-    method: str,
-    url: str,
-    payload: dict[str, Any] | None = None,
-) -> tuple[int | None, dict[str, Any]]:
-    # HTTP-запрос к бэкенду
-    try:
-        async with http_session.request(method=method, url=url, json=payload) as response:
-            try:
-                data = await response.json(content_type=None)
-            except (ContentTypeError, ValueError):
-                text = await response.text()
-                data = {"error": text or "Некорректный ответ сервера"}
-
-            if isinstance(data, dict):
-                return response.status, data
-
-            return response.status, {"data": data}
-    except (asyncio.TimeoutError, ClientError):
-        return None, {"error": "Сервис временно недоступен"}
+    return STORAGES[storage_path]
 
 
 async def send_auth_menu(message: Message, text: str) -> None:
@@ -176,32 +151,34 @@ async def registration_entry(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await state.set_state(RegistrationStates.waiting_name)
-    await message.answer("Введите имя. Для отмены отправьте /cancel.")
+    await state.set_state(RegistrationStates.waiting_full_name)
+    await message.answer("Введите ФИО. Для отмены отправьте /cancel.")
 
 
-@router.message(RegistrationStates.waiting_name)
-async def registration_name_step(message: Message, state: FSMContext) -> None:
-    # Получение имени
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Имя не должно быть пустым. Введите имя ещё раз.")
+@router.message(RegistrationStates.waiting_full_name)
+async def registration_full_name_step(message: Message, state: FSMContext) -> None:
+    # Получение ФИО
+    full_name = (message.text or "").strip()
+    if not full_name:
+        await message.answer("ФИО не должно быть пустым. Введите ФИО ещё раз.")
         return
 
-    await state.update_data(name=name)
-    await state.set_state(RegistrationStates.waiting_email)
-    await message.answer("Введите email. Для отмены отправьте /cancel.")
+    await state.update_data(full_name=full_name)
+    await state.set_state(RegistrationStates.waiting_login)
+    await message.answer("Введите логин. Для отмены отправьте /cancel.")
 
 
-@router.message(RegistrationStates.waiting_email)
-async def registration_email_step(message: Message, state: FSMContext) -> None:
-    # Получение email
-    email = (message.text or "").strip()
-    if not is_valid_email(email):
-        await message.answer("Некорректный email. Введите email ещё раз.")
+@router.message(RegistrationStates.waiting_login)
+async def registration_login_step(message: Message, state: FSMContext) -> None:
+    # Получение логина
+    login = (message.text or "").strip()
+    if not is_valid_login(login):
+        await message.answer(
+            "Логин должен быть длиной от 3 до 32 символов и без пробелов.",
+        )
         return
 
-    await state.update_data(email=email)
+    await state.update_data(login=login)
     await state.set_state(RegistrationStates.waiting_password)
     await message.answer("Введите пароль. Для отмены отправьте /cancel.")
 
@@ -211,91 +188,37 @@ async def registration_password_step(
     message: Message,
     state: FSMContext,
     settings: Settings,
-    http_session: ClientSession,
 ) -> None:
-    # Отправка данных регистрации
-    password = (message.text or "").strip()
-    if not password:
-        await message.answer("Пароль не должен быть пустым. Введите пароль ещё раз.")
-        return
-
-    data = await state.get_data()
-    await state.update_data(password=password)
-
-    payload = {
-        "name": data["name"],
-        "email": data["email"],
-        "password": password,
-        "is_verifyCode": False,
-    }
-
-    _, response_data = await request_json(
-        http_session,
-        "POST",
-        build_auth_url(settings, "/auth/register-user"),
-        payload,
-    )
-
-    if response_data.get("error") == "user already exists":
-        await state.clear()
-        await send_auth_menu(message, "Такой email уже зарегистрирован.")
-        return
-
-    if response_data.get("status") == "ok":
-        await state.set_state(RegistrationStates.waiting_code)
-        await message.answer("Код отправлен на почту. Введите код подтверждения.")
-        return
-
-    await state.clear()
-    await send_auth_menu(
-        message,
-        f"Не удалось начать регистрацию: {extract_error(response_data, 'Неизвестная ошибка')}.",
-    )
-
-
-@router.message(RegistrationStates.waiting_code)
-async def registration_code_step(
-    message: Message,
-    state: FSMContext,
-    settings: Settings,
-    http_session: ClientSession,
-) -> None:
-    # Подтверждение регистрации
+    # Регистрация пользователя
     if message.from_user is None:
         return
 
-    code = (message.text or "").strip()
-    if not code:
-        await message.answer("Код не должен быть пустым. Введите код ещё раз.")
+    password = (message.text or "").strip()
+    if len(password) < 4:
+        await message.answer("Пароль должен содержать минимум 4 символа.")
         return
 
     data = await state.get_data()
-    payload = {
-        "name": data["name"],
-        "email": data["email"],
-        "password": data["password"],
-        "is_verifyCode": True,
-        "code": code,
-    }
-
-    _, response_data = await request_json(
-        http_session,
-        "POST",
-        build_auth_url(settings, "/auth/register-user"),
-        payload,
+    storage = get_storage(settings)
+    is_created, result = storage.register_user(
+        full_name=data["full_name"],
+        login=data["login"],
+        password=password,
     )
 
-    if response_data.get("status") == "ok":
-        authorize_user(message.from_user.id)
+    if not is_created and result == "user already exists":
         await state.clear()
-        await send_main_menu(message, "Регистрация завершена. Доступ к CRUD-меню открыт.")
+        await send_auth_menu(message, "Такой логин уже зарегистрирован.")
         return
 
+    if not is_created:
+        await state.clear()
+        await send_auth_menu(message, "Не удалось завершить регистрацию.")
+        return
+
+    authorize_user(message.from_user.id)
     await state.clear()
-    await send_auth_menu(
-        message,
-        f"Не удалось завершить регистрацию: {extract_error(response_data, 'Неизвестная ошибка')}.",
-    )
+    await send_main_menu(message, "Регистрация завершена. Вход выполнен.")
 
 
 @router.message(StateFilter(None), F.text == LOGIN_TEXT)
@@ -306,19 +229,21 @@ async def login_entry(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await state.set_state(LoginStates.waiting_email)
-    await message.answer("Введите email. Для отмены отправьте /cancel.")
+    await state.set_state(LoginStates.waiting_login)
+    await message.answer("Введите логин. Для отмены отправьте /cancel.")
 
 
-@router.message(LoginStates.waiting_email)
-async def login_email_step(message: Message, state: FSMContext) -> None:
-    # Получение email для входа
-    email = (message.text or "").strip()
-    if not is_valid_email(email):
-        await message.answer("Некорректный email. Введите email ещё раз.")
+@router.message(LoginStates.waiting_login)
+async def login_login_step(message: Message, state: FSMContext) -> None:
+    # Получение логина для входа
+    login = (message.text or "").strip()
+    if not is_valid_login(login):
+        await message.answer(
+            "Логин должен быть длиной от 3 до 32 символов и без пробелов.",
+        )
         return
 
-    await state.update_data(email=email)
+    await state.update_data(login=login)
     await state.set_state(LoginStates.waiting_password)
     await message.answer("Введите пароль. Для отмены отправьте /cancel.")
 
@@ -328,91 +253,39 @@ async def login_password_step(
     message: Message,
     state: FSMContext,
     settings: Settings,
-    http_session: ClientSession,
 ) -> None:
-    # Отправка данных входа
+    # Проверка логина и пароля
+    if message.from_user is None:
+        return
+
     password = (message.text or "").strip()
     if not password:
         await message.answer("Пароль не должен быть пустым. Введите пароль ещё раз.")
         return
 
     data = await state.get_data()
-    await state.update_data(password=password)
-
-    payload = {
-        "email": data["email"],
-        "password": password,
-    }
-
-    _, response_data = await request_json(
-        http_session,
-        "POST",
-        build_auth_url(settings, "/auth/login-user"),
-        payload,
+    storage = get_storage(settings)
+    is_verified, result = storage.verify_user(
+        login=data["login"],
+        password=password,
     )
 
-    if response_data.get("status") == "ok":
-        await state.set_state(LoginStates.waiting_code)
-        await message.answer("Код отправлен на почту. Введите код подтверждения.")
+    if not is_verified and result == "user not found":
+        await state.clear()
+        await send_auth_menu(message, "Пользователь с таким логином не найден.")
         return
 
-    await state.clear()
-
-    if response_data.get("error") == "user not found":
-        await send_auth_menu(message, "Пользователь с таким email не найден.")
-        return
-
-    if response_data.get("error") == "incorrect password":
+    if not is_verified and result == "incorrect password":
+        await state.clear()
         await send_auth_menu(message, "Неверный пароль. Начните вход заново.")
         return
 
-    await send_auth_menu(
-        message,
-        f"Не удалось выполнить вход: {extract_error(response_data, 'Неизвестная ошибка')}.",
-    )
-
-
-@router.message(LoginStates.waiting_code)
-async def login_code_step(
-    message: Message,
-    state: FSMContext,
-    settings: Settings,
-    http_session: ClientSession,
-) -> None:
-    # Проверка кода входа
-    if message.from_user is None:
-        return
-
-    code = (message.text or "").strip()
-    if not code:
-        await message.answer("Код не должен быть пустым. Введите код ещё раз.")
-        return
-
-    data = await state.get_data()
-    payload = {
-        "email": data["email"],
-        "code": code,
-    }
-
-    _, response_data = await request_json(
-        http_session,
-        "POST",
-        build_auth_url(settings, "/auth/verify-code"),
-        payload,
-    )
-
-    if response_data.get("status") == "ok" or response_data.get("error") == "time is up":
-        authorize_user(message.from_user.id)
+    if not is_verified:
         await state.clear()
-        await send_main_menu(message, "Вход выполнен!")
+        await send_auth_menu(message, "Не удалось выполнить вход.")
         return
 
-    if response_data.get("error") == "invalid code":
-        await message.answer("Неверный код. Введите код ещё раз или отправьте /cancel.")
-        return
-
+    authorize_user(message.from_user.id)
     await state.clear()
-    await send_auth_menu(
-        message,
-        f"Не удалось завершить вход: {extract_error(response_data, 'Неизвестная ошибка')}.",
-    )
+    await send_main_menu(message, "Вход выполнен!")
+
